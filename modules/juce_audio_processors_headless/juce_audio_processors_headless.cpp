@@ -71,3 +71,8 @@
 #include <juce_audio_processors_headless/format_types/juce_VSTPluginFormatHeadless.cpp>
 #include <juce_audio_processors_headless/format_types/juce_ARAHosting.cpp>
 #include <juce_audio_processors_headless/format/juce_AudioPluginFormatManager.cpp>
+
+#if JUCE_UNIT_TESTS
+ #include <juce_audio_processors_headless/utilities/juce_DeferredParameterUpdates.h>
+ #include <juce_audio_processors_headless/utilities/juce_DeferredParameterUpdates_test.cpp>
+#endif
