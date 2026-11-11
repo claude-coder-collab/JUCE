@@ -43,6 +43,7 @@
 #include <juce_gui_basics/native/juce_WindowsHooks_windows.h>
 
 #include <juce_audio_processors_headless/format_types/juce_LegacyAudioParameter.h>
+#include <juce_audio_processors_headless/utilities/juce_DeferredParameterUpdates.h>
 
 JUCE_BEGIN_IGNORE_WARNINGS_MSVC (4127 4512 4996 5272)
 JUCE_BEGIN_IGNORE_WARNINGS_GCC_LIKE ("-Wdeprecated-declarations",
@@ -494,6 +495,7 @@ namespace AAXClasses
         int32_t* isPrepared;
         float* const* meterTapBuffers;
         int32_t* sideChainBuffers;
+        int64_t* parameterState;
     };
 
     struct JUCEAlgorithmIDs
@@ -511,9 +513,14 @@ namespace AAXClasses
 
             meterTapBuffers   = AAX_FIELD_INDEX (JUCEAlgorithmContext, meterTapBuffers),
 
-            sideChainBuffers  = AAX_FIELD_INDEX (JUCEAlgorithmContext, sideChainBuffers)
+            sideChainBuffers  = AAX_FIELD_INDEX (JUCEAlgorithmContext, sideChainBuffers),
+
+            parameterState    = AAX_FIELD_INDEX (JUCEAlgorithmContext, parameterState)
         };
     };
+
+    //==============================================================================
+    static thread_local bool inParameterChangedCallback = false;
 
     //==============================================================================
     class JuceAAX_Processor;
@@ -803,8 +810,6 @@ namespace AAXClasses
         JuceAAX_Processor()
             : pluginInstance (createPluginFilterOfType (AudioProcessor::wrapperType_AAX))
         {
-            inParameterChangedCallback = false;
-
             pluginInstance->setPlayHead (this);
             pluginInstance->addListener (this);
 
@@ -887,6 +892,10 @@ namespace AAXClasses
         {
             if (chunkID != juceChunkType)
                 return AAX_CEffectParameters::GetChunkSize (chunkID, oSize);
+
+            // The host expects the state to include the values that it has already sent
+            if (deferredUpdates != nullptr)
+                applyAllDeferredParameterUpdates();
 
             auto& chunkMemoryBlock = perThreadFilterData.get();
 
@@ -992,15 +1001,21 @@ namespace AAXClasses
 
         void setAudioProcessorParameter (AAX_CParamID paramID, double value)
         {
-            if (auto* param = getParameterFromID (paramID))
+            const auto index = getJuceIndexFromID (paramID);
+
+            if (auto* param = juceParameters.getParamForIndex (index))
             {
+                // This value replaces any that are still waiting for the audio callback
+                if (deferredUpdates != nullptr)
+                    deferredUpdates->cancel ((size_t) index);
+
                 auto newValue = static_cast<float> (value);
 
                 if (! approximatelyEqual (newValue, param->getValue()))
                 {
                     param->setValue (newValue);
 
-                    inParameterChangedCallback = true;
+                    const ScopedValueSetter<bool> scope { inParameterChangedCallback, true };
                     param->sendValueChangedMessageToListeners (newValue);
                 }
             }
@@ -1016,9 +1031,53 @@ namespace AAXClasses
         AAX_Result UpdateParameterNormalizedValue (AAX_CParamID paramID, double value, AAX_EUpdateSource source) override
         {
             auto result = AAX_CEffectParameters::UpdateParameterNormalizedValue (paramID, value, source);
-            setAudioProcessorParameter (paramID, value);
+
+            // The host sends automation ahead of the audio that it belongs to, so
+            // those values are held back until the audio callback catches up.
+            // See "Parameter update timing" in the AAX SDK documentation.
+            if (shouldDeferParameterUpdate (paramID, source))
+            {
+                const auto index = getJuceIndexFromID (paramID);
+                const auto newValue = static_cast<float> (value);
+
+                if (deferredUpdates->getPendingValue ((size_t) index).has_value()
+                    || ! approximatelyEqual (newValue, juceParameters.getParamForIndex (index)->getValue()))
+                {
+                    deferredUpdates->set ((size_t) index, newValue);
+                }
+            }
+            else
+            {
+                setAudioProcessorParameter (paramID, value);
+            }
 
             return result;
+        }
+
+        AAX_Result GenerateCoefficients() override
+        {
+            const auto result = AAX_CEffectParameters::GenerateCoefficients();
+
+            if (deferredUpdates == nullptr)
+                return result;
+
+            // Packets posted here are delivered to the audio callback along
+            // with the audio that the preceding parameter updates belong to.
+            if (! deferredUpdates->commit())
+                applyAllDeferredParameterUpdates();
+
+            const auto state = deferredUpdates->getLatestState();
+
+            if (Controller()->PostPacket (JUCEAlgorithmIDs::parameterState, &state, sizeof (state)) != AAX_SUCCESS)
+                applyAllDeferredParameterUpdates();
+
+            return result;
+        }
+
+        AAX_Result TimerWakeup() override
+        {
+            applyStalledDeferredParameterUpdates();
+            return AAX_CEffectParameters::TimerWakeup();
         }
 
         AAX_Result GetParameterValueFromString (AAX_CParamID paramID, double* result, const AAX_IString& text) const override
@@ -1053,10 +1112,7 @@ namespace AAXClasses
 
         AAX_Result GetParameterNormalizedValue (AAX_CParamID paramID, double* result) const override
         {
-            if (auto* param = getParameterFromID (paramID))
-                *result = (double) param->getValue();
-            else
-                *result = 0.0;
+            *result = (double) getParameterValueForHost (paramID).orFallback (0.0f);
 
             return AAX_SUCCESS;
         }
@@ -1073,9 +1129,9 @@ namespace AAXClasses
 
         AAX_Result SetParameterNormalizedRelative (AAX_CParamID paramID, double newDeltaValue) override
         {
-            if (auto* param = getParameterFromID (paramID))
+            if (const auto currentValue = getParameterValueForHost (paramID))
             {
-                auto newValue = param->getValue() + (float) newDeltaValue;
+                auto newValue = *currentValue + (float) newDeltaValue;
 
                 setAudioProcessorParameter (paramID, jlimit (0.0f, 1.0f, newValue));
 
@@ -1277,11 +1333,8 @@ namespace AAXClasses
 
         void audioProcessorParameterChanged (AudioProcessor* /*processor*/, int parameterIndex, float newValue) override
         {
-            if (inParameterChangedCallback.get())
-            {
-                inParameterChangedCallback = false;
+            if (inParameterChangedCallback)
                 return;
-            }
 
             if (auto paramID = getAAXParamIDFromJuceIndex (parameterIndex))
                 SetParameterNormalizedValue (paramID, (double) newValue);
@@ -1381,13 +1434,19 @@ namespace AAXClasses
         void process (const float* const* inputs, float* const* outputs, const int sideChainBufferIdx,
                       const int bufferSize, const bool bypass,
                       AAX_IMIDINode* midiNodeIn, AAX_IMIDINode* midiNodesOut,
-                      float* const meterBuffers)
+                      float* const meterBuffers, const int64_t parameterState)
         {
             auto numIns    = pluginInstance->getTotalNumInputChannels();
             auto numOuts   = pluginInstance->getTotalNumOutputChannels();
             auto numMeters = aaxMeters.size();
 
             const ScopedLock sl (pluginInstance->getCallbackLock());
+
+            numRenderCallbacks.fetch_add (1, std::memory_order_relaxed);
+
+            if (deferredUpdates != nullptr)
+                numDeferredUpdatesRendered.fetch_add (applyDeferredParameterUpdates (parameterState, DeferredParameterUpdates::Blocking::no),
+                                                      std::memory_order_relaxed);
 
             bool isSuspended = [this, sideChainBufferIdx]
             {
@@ -1766,7 +1825,7 @@ namespace AAXClasses
                 aaxParamIDs.add (paramID);
                 auto* aaxParamID = aaxParamIDs.getReference ((int) parameterIndex).toRawUTF8();
 
-                paramMap.set (AAXClasses::getAAXParamHash (aaxParamID), juceParam);
+                paramMap.set (AAXClasses::getAAXParamHash (aaxParamID), (int) parameterIndex);
 
                 // is this a meter?
                 if (((category & 0xffff0000) >> 16) == 2)
@@ -1805,6 +1864,114 @@ namespace AAXClasses
 
                 if (isBypassParameter)
                     mPacketDispatcher.RegisterPacket (aaxParamID, JUCEAlgorithmIDs::bypass);
+            }
+
+            const auto numParameters = juceParameters.size();
+            deferredUpdates = std::make_unique<DeferredParameterUpdates> (numParameters, jmax (numParameters, (size_t) 4096));
+        }
+
+        //==============================================================================
+        bool isParameterTouched (AAX_CParamID paramID)
+        {
+            AAX_CBoolean touched = false;
+
+            if (auto* delegate = AutomationDelegate())
+                if (delegate->GetTouchState (paramID, &touched) != AAX_SUCCESS)
+                    return false;
+
+            return touched != 0;
+        }
+
+        bool shouldDeferParameterUpdate (AAX_CParamID paramID, AAX_EUpdateSource source)
+        {
+            if (deferredUpdates == nullptr || source == AAX_eUpdateSource_Chunk)
+                return false;
+
+            auto* param = getParameterFromID (paramID);
+
+            // While a parameter is being touched its values come from the user, rather
+            // than from automation, and the plug-in might have applied them already.
+            return param != nullptr && param->isAutomatable() && ! isParameterTouched (paramID);
+        }
+
+        Optional<float> getParameterValueForHost (AAX_CParamID paramID) const
+        {
+            const auto index = getJuceIndexFromID (paramID);
+            auto* param = juceParameters.getParamForIndex (index);
+
+            if (param == nullptr)
+                return {};
+
+            if (deferredUpdates != nullptr)
+                if (const auto pending = deferredUpdates->getPendingValue ((size_t) index))
+                    return *pending;
+
+            return param->getValue();
+        }
+
+        uint32 applyDeferredParameterUpdates (int64_t state, DeferredParameterUpdates::Blocking blocking) const
+        {
+            const ScopedValueSetter<bool> scope { inParameterChangedCallback, true };
+
+            const auto setValue = [this] (size_t index, float value)
+            {
+                if (auto* param = juceParameters.getParamForIndex ((int) index))
+                    param->setValue (value);
+            };
+
+            uint32 numApplied = 0;
+
+            while (const auto update = deferredUpdates->applyNextUpdate (state, blocking, setValue))
+            {
+                if (auto* param = juceParameters.getParamForIndex ((int) update->parameterIndex))
+                    param->sendValueChangedMessageToListeners (update->value);
+
+                ++numApplied;
+            }
+
+            return numApplied;
+        }
+
+        void applyAllDeferredParameterUpdates() const
+        {
+            while (deferredUpdates->hasPendingUpdates())
+            {
+                deferredUpdates->commit();
+                applyDeferredParameterUpdates (std::numeric_limits<int64_t>::max(), DeferredParameterUpdates::Blocking::yes);
+            }
+        }
+
+        /*  Deferred updates are normally applied by the audio callback, but the
+            host won't always call it, e.g. when the track has no audio to process.
+            This makes sure that the processor still ends up with the values that
+            the host expects it to have.
+        */
+        void applyStalledDeferredParameterUpdates()
+        {
+            if (deferredUpdates == nullptr)
+                return;
+
+            const auto now = std::chrono::steady_clock::now();
+            const auto timeout = std::chrono::seconds (1);
+
+            if (const auto numCallbacks = numRenderCallbacks.load (std::memory_order_relaxed);
+                std::exchange (lastNumRenderCallbacks, numCallbacks) != numCallbacks)
+            {
+                lastRenderCallbackTime = now;
+            }
+
+            const auto hasPendingUpdates = deferredUpdates->hasPendingUpdates();
+
+            if (const auto numRendered = numDeferredUpdatesRendered.load (std::memory_order_relaxed);
+                std::exchange (lastNumDeferredUpdatesRendered, numRendered) != numRendered || ! hasPendingUpdates)
+            {
+                lastDeferredUpdateProgressTime = now;
+            }
+
+            if (hasPendingUpdates && (now - lastRenderCallbackTime > timeout
+                                      || now - lastDeferredUpdateProgressTime > timeout))
+            {
+                applyAllDeferredParameterUpdates();
             }
         }
 
@@ -2010,7 +2177,9 @@ namespace AAXClasses
                                                       *(i.bypass) != 0,
                                                       parameters.supportsMidiIn  ? i.midiNodeIn  : nullptr,
                                                       parameters.supportsMidiOut ? i.midiNodeOut : nullptr,
-                                                      meterTapBuffers);
+                                                      meterTapBuffers,
+                                                      i.parameterState != nullptr ? *i.parameterState
+                                                                                  : std::numeric_limits<int64_t>::max());
             }
         }
 
@@ -2173,9 +2342,15 @@ namespace AAXClasses
             return nullptr;
         }
 
+        int getJuceIndexFromID (AAX_CParamID paramID) const noexcept
+        {
+            const auto hash = AAXClasses::getAAXParamHash (paramID);
+            return paramMap.contains (hash) ? paramMap[hash] : -1;
+        }
+
         AudioProcessorParameter* getParameterFromID (AAX_CParamID paramID) const noexcept
         {
-            return paramMap [AAXClasses::getAAXParamHash (paramID)];
+            return juceParameters.getParamForIndex (getJuceIndexFromID (paramID));
         }
 
         //==============================================================================
@@ -2306,9 +2481,15 @@ namespace AAXClasses
         Array<int> inputLayoutMap, outputLayoutMap;
 
         Array<String> aaxParamIDs;
-        HashMap<int32, AudioProcessorParameter*> paramMap;
+        HashMap<int32, int> paramMap;
         LegacyAudioParametersWrapper juceParameters;
         std::unique_ptr<AudioProcessorParameter> ownedBypassParameter;
+
+        std::unique_ptr<DeferredParameterUpdates> deferredUpdates;
+        std::atomic<uint32> numRenderCallbacks { 0 }, numDeferredUpdatesRendered { 0 };
+        uint32 lastNumRenderCallbacks = 0, lastNumDeferredUpdatesRendered = 0;
+        std::chrono::steady_clock::time_point lastRenderCallbackTime = std::chrono::steady_clock::now(),
+                                              lastDeferredUpdateProgressTime = lastRenderCallbackTime;
 
         Array<AudioProcessorParameter*> aaxMeters;
 
@@ -2326,8 +2507,6 @@ namespace AAXClasses
         // in a hash map with the thread id as a key.
         mutable ThreadLocalValue<ChunkMemoryBlock> perThreadFilterData;
         CriticalSection perThreadDataLock;
-
-        ThreadLocalValue<bool> inParameterChangedCallback;
 
         JUCE_DECLARE_NON_COPYABLE (JuceAAX_Processor)
     };
@@ -2538,6 +2717,8 @@ namespace AAXClasses
             // so just add a dummy one here if there aren't any side chains
             check (desc.AddPrivateData (JUCEAlgorithmIDs::sideChainBuffers, sizeof (uintptr_t)));
         }
+
+        check (desc.AddDataInPort (JUCEAlgorithmIDs::parameterState, sizeof (int64_t)));
 
         auto maxAuxBuses = jmax (0, jmin (15, fullLayout.outputBuses.size() - 1));
 

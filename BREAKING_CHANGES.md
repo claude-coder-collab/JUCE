@@ -4,6 +4,48 @@
 
 ## Change
 
+AAX plug-ins now apply automation from the host at the start of the audio
+callback that processes the audio the automation belongs to, rather than as
+soon as the host sends it. Parameter changes made by the plug-in in response to
+a parameter change from the host are no longer sent back to the host.
+
+**Possible Issues**
+
+For automatable parameters, AudioProcessorParameter::Listener callbacks that
+result from host automation, and from other changes made by the host while a
+parameter isn't being touched, are now made on the audio thread. Until the
+audio callback has applied such a change, the parameter holds its previous
+value. Plug-ins that update linked parameters from inside a parameter callback
+triggered by the host will find that the host isn't told about the linked
+changes.
+
+**Workaround**
+
+Listener callbacks must be realtime-safe, as is already required for other
+plug-in formats. To tell the host about a change to a linked parameter, make
+the change asynchronously, outside of the callback.
+
+**Rationale**
+
+Pro Tools sends automation to a plug-in ahead of the audio that it applies to,
+and expects the plug-in to delay the new values using the packet mechanism
+described in the "Parameter update timing" section of the AAX SDK
+documentation. Applying the values immediately meant that automation took
+effect early, by an amount that depended on the host's buffer size and delay
+compensation.
+
+Delayed automation is applied on the audio thread, so the parameter callbacks
+for it now run there. If such a callback changed a linked parameter and the
+wrapper reported that change, the wrapper would be calling into the host from
+the audio thread. The wrapper therefore no longer reports parameter changes
+that are made from inside a callback for a change that came from the host. The
+VST3 wrapper already behaves this way. Before this change, the AAX wrapper
+left out only the first linked change made inside such a callback, and
+reported any others.
+
+
+## Change
+
 The deprecated function `MessageBoxOptions::makeOptionsYesNo` no longer
 produces a dialog that can be dismissed with 'escape' and confirmed with
 'return'.
